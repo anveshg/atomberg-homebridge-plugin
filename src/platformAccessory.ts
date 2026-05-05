@@ -11,8 +11,10 @@ import {
   COLOR_TEMP_COOL_MIRED,
   COLOR_TEMP_DAYLIGHT_MIRED,
   COLOR_TEMP_WARM_MIRED,
+  COMMAND_DEBOUNCE_MS,
   FAN_SPEED_MAX,
   FAN_SPEED_MIN,
+  LEGACY_FAN_SPEED_MAX,
   LIGHT_MODE_COOL,
   LIGHT_MODE_DAYLIGHT,
   LIGHT_MODE_WARM,
@@ -32,6 +34,14 @@ export class AtombergFanPlatformAccessory {
   private lightbulbService: Service;
   private readonly supportsBrightness: boolean;
   private readonly supportsColor: boolean;
+  private readonly fanSpeedMax: number;
+
+  // Command coalescer state. We accumulate the latest desired values per key
+  // (power/speed/led/brightness/light_mode) and flush after COMMAND_DEBOUNCE_MS
+  // of inactivity. Last-write-wins per key — a slider drag from 0%→100% sends
+  // one final speed instead of dozens of intermediate ones.
+  private pendingCommand: AtombergFanCommand = {};
+  private flushTimer: NodeJS.Timeout | undefined;
 
   constructor(
     private readonly platform: AtombergFanPlatform,
@@ -58,6 +68,7 @@ export class AtombergFanPlatformAccessory {
     const model: string = accessory.context.device.model ?? '';
     this.supportsBrightness = BRIGHTNESS_SERIES.includes(series);
     this.supportsColor = COLOR_MODE_SERIES.includes(series);
+    this.fanSpeedMax = platform.platformConfig.legacy5Speed ? LEGACY_FAN_SPEED_MAX : FAN_SPEED_MAX;
 
     const modelName = [model, series].filter(Boolean).join(' ') || 'Unknown';
 
@@ -107,6 +118,14 @@ export class AtombergFanPlatformAccessory {
         .onSet(this.setLEDTemperature.bind(this));
     }
 
+    // Single-tile UI: surface as one fan accessory in the Home app, with the
+    // LED reachable as a sub-control rather than a separate top-level tile.
+    // setPrimaryService is only available on Homebridge ≥1.6 / hap-nodejs ≥0.10.
+    if (typeof (this.fanService as unknown as { setPrimaryService?: (v: boolean) => void }).setPrimaryService === 'function') {
+      (this.fanService as unknown as { setPrimaryService: (v: boolean) => void }).setPrimaryService(true);
+    }
+    this.fanService.addLinkedService(this.lightbulbService);
+
     this.refreshDeviceStatus(this.fanState);
   }
 
@@ -115,7 +134,7 @@ export class AtombergFanPlatformAccessory {
     const powerOn = value === this.platform.Characteristic.Active.ACTIVE;
     this.fanState.power = powerOn;
     this.platform.log.debug(`Set Active -> ${powerOn}`);
-    await this.sendDeviceUpdate({ power: powerOn });
+    this.queueCommand({ power: powerOn });
   }
 
   async setRotationSpeed(value: CharacteristicValue): Promise<void> {
@@ -127,15 +146,15 @@ export class AtombergFanPlatformAccessory {
       // which is outside Atomberg's documented 1..6 range.
       this.fanState.power = false;
       this.platform.log.debug('Set RotationSpeed -> 0 (interpreted as power off)');
-      await this.sendDeviceUpdate({ power: false });
+      this.queueCommand({ power: false });
       return;
     }
 
-    const speed = percentageToSpeed(pct);
+    const speed = this.percentageToSpeed(pct);
     this.fanState.last_recorded_speed = speed;
     this.fanState.power = true;
     this.platform.log.debug(`Set RotationSpeed -> ${pct}% (speed ${speed})`);
-    await this.sendDeviceUpdate({ speed });
+    this.queueCommand({ speed });
   }
 
   async setLED(value: CharacteristicValue): Promise<void> {
@@ -143,7 +162,7 @@ export class AtombergFanPlatformAccessory {
     const on = value as boolean;
     this.fanState.led = on;
     this.platform.log.debug(`Set LED -> ${on}`);
-    await this.sendDeviceUpdate({ led: on });
+    this.queueCommand({ led: on });
   }
 
   async setLEDBrightness(value: CharacteristicValue): Promise<void> {
@@ -153,7 +172,7 @@ export class AtombergFanPlatformAccessory {
       // Brightness 0 from HomeKit is the slider hitting bottom — turn LED off.
       this.fanState.led = false;
       this.platform.log.debug('Set Brightness -> 0 (interpreted as LED off)');
-      await this.sendDeviceUpdate({ led: false });
+      this.queueCommand({ led: false });
       return;
     }
     pct = clamp(pct, BRIGHTNESS_MIN, BRIGHTNESS_MAX);
@@ -162,7 +181,7 @@ export class AtombergFanPlatformAccessory {
     this.platform.log.debug(`Set Brightness -> ${pct}`);
     // Per Atomberg docs the device auto-turns LED on when given a brightness
     // value, so we don't need to send {led: true} alongside.
-    await this.sendDeviceUpdate({ brightness: pct });
+    this.queueCommand({ brightness: pct });
   }
 
   async setLEDTemperature(value: CharacteristicValue): Promise<void> {
@@ -170,7 +189,7 @@ export class AtombergFanPlatformAccessory {
     const mode = miredToLightMode(value as number);
     this.fanState.last_recorded_color = mode;
     this.platform.log.debug(`Set ColorTemperature -> ${value} mired (${mode})`);
-    await this.sendDeviceUpdate({ light_mode: mode });
+    this.queueCommand({ light_mode: mode });
   }
 
   /**
@@ -196,7 +215,7 @@ export class AtombergFanPlatformAccessory {
         : this.platform.Characteristic.Active.INACTIVE;
       this.fanService.updateCharacteristic(this.platform.Characteristic.Active, active);
 
-      const speedPct = deviceState.power ? speedToPercentage(deviceState.last_recorded_speed) : 0;
+      const speedPct = deviceState.power ? this.speedToPercentage(deviceState.last_recorded_speed) : 0;
       this.fanService.updateCharacteristic(this.platform.Characteristic.RotationSpeed, speedPct);
 
       this.lightbulbService.updateCharacteristic(this.platform.Characteristic.On, !!deviceState.led);
@@ -230,11 +249,55 @@ export class AtombergFanPlatformAccessory {
     this.fanState.is_online = true;
   }
 
+  /**
+   * Called when the liveness watchdog sees the device fall silent. Flips
+   * is_online to false (so HomeKit set handlers throw a comm-failure rather
+   * than dispatching to a fan that won't receive the packet) and pushes the
+   * inactive state to HomeKit so the tile shows greyed-out.
+   */
+  public markOffline(): void {
+    if (!this.fanState.is_online) {
+      return;
+    }
+    this.fanState.is_online = false;
+    try {
+      this.fanService.updateCharacteristic(
+        this.platform.Characteristic.Active,
+        this.platform.Characteristic.Active.INACTIVE,
+      );
+    } catch {
+      // Non-fatal — the tile will catch up on the next state push.
+    }
+  }
+
   private assertOnline(): void {
     if (!this.fanState.is_online) {
       this.platform.log.info(`Device ['${this.accessory.displayName}'] is offline`);
       throw new this.platform.api.hap.HapStatusError(HAPStatus.SERVICE_COMMUNICATION_FAILURE);
     }
+  }
+
+  /**
+   * Coalesce a HomeKit characteristic write into the pending command. Each call
+   * resets the flush timer; after COMMAND_DEBOUNCE_MS of quiet, we ship one
+   * combined payload. Last-write-wins per key — dragging the slider 0%→100%
+   * collapses to a single `speed` value instead of dozens of intermediate
+   * cloud calls.
+   */
+  private queueCommand(partial: AtombergFanCommand): void {
+    Object.assign(this.pendingCommand, partial);
+    if (this.flushTimer) {
+      clearTimeout(this.flushTimer);
+    }
+    this.flushTimer = setTimeout(() => {
+      this.flushTimer = undefined;
+      const command = this.pendingCommand;
+      this.pendingCommand = {};
+      if (Object.keys(command).length === 0) {
+        return;
+      }
+      this.sendDeviceUpdate(command).catch(() => undefined);
+    }, COMMAND_DEBOUNCE_MS);
   }
 
   /**
@@ -262,28 +325,24 @@ export class AtombergFanPlatformAccessory {
       }
     }
   }
+
+  /** Per-instance percentageToSpeed that respects legacy5Speed. */
+  private percentageToSpeed(pct: number): number {
+    const clamped = clamp(pct, 1, 100);
+    return clamp(Math.ceil(clamped * this.fanSpeedMax / 100), FAN_SPEED_MIN, this.fanSpeedMax);
+  }
+
+  /** Per-instance speedToPercentage that respects legacy5Speed. */
+  private speedToPercentage(speed: number): number {
+    if (speed <= 0) {
+      return 0;
+    }
+    return clamp(Math.round(speed * 100 / this.fanSpeedMax), 0, 100);
+  }
 }
 
 function clamp(n: number, lo: number, hi: number): number {
   return Math.max(lo, Math.min(hi, n));
-}
-
-/**
- * Map a HomeKit 0..100 percentage to an Atomberg fan speed in 1..6.
- * Mirrors the ordered-list mapping used in the Home Assistant integration so
- * the same physical "speed N" lines up across both ecosystems.
- */
-function percentageToSpeed(pct: number): number {
-  const clamped = clamp(pct, 1, 100);
-  // ceil ensures any positive percentage maps to at least speed 1.
-  return clamp(Math.ceil(clamped * FAN_SPEED_MAX / 100), FAN_SPEED_MIN, FAN_SPEED_MAX);
-}
-
-function speedToPercentage(speed: number): number {
-  if (speed <= 0) {
-    return 0;
-  }
-  return clamp(Math.round(speed * 100 / FAN_SPEED_MAX), 0, 100);
 }
 
 function miredToLightMode(mired: number): 'cool' | 'daylight' | 'warm' {

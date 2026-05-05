@@ -31,6 +31,12 @@
         "type": "boolean",
         "default": false,
         "description": "By default the plugin sends commands directly to the fan over your LAN (UDP/5600) when reachable, and only falls back to the cloud API. Enable this if Homebridge can't see the fans' subnet (Docker bridge networking, VLAN isolation, etc.) — every command will then count against the 100 calls/day Atomberg quota."
+      },
+      "legacy5Speed": {
+        "title": "Legacy 5-speed fans",
+        "type": "boolean",
+        "default": false,
+        "description": "Enable for pre-2022 Atomberg fans that only support 5 speed levels (Renesa, Studio). The HomeKit rotation slider will quantize to 1..5 instead of 1..6."
       }
     }
   },
@@ -54,6 +60,11 @@
       "type": "flex",
       "flex-flow": "row wrap",
       "items": ["useCloudOnly"]
+    },
+    {
+      "type": "flex",
+      "flex-flow": "row wrap",
+      "items": ["legacy5Speed"]
     }
   ]
 }

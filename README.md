@@ -1,24 +1,27 @@
 <span align="center">
 
-# Homebridge Atomberg Fan
+# homebridge-atomberg-plugin
 
 </span>
 
-[![verified-by-homebridge](https://badgen.net/badge/homebridge/verified/purple)](https://github.com/homebridge/homebridge/wiki/Verified-Plugins)
-[![GitHub version](https://img.shields.io/github/package-json/v/Sangwan5688/homebridge-atomberg-fan?label=GitHub)](https://github.com/Sangwan5688/homebridge-atomberg-fan)
-[![npm version](https://img.shields.io/npm/v/homebridge-atomberg-fan?color=%23cb3837&label=npm)](https://www.npmjs.com/package/homebridge-atomberg-fan)
+[![npm version](https://img.shields.io/npm/v/homebridge-atomberg-plugin?color=%23cb3837&label=npm)](https://www.npmjs.com/package/homebridge-atomberg-plugin)
 
-Homebridge Atomberg Fan is a plugin for [Homebridge](https://homebridge.io/) that provides Homekit support for [Atomberg Smart Fans](https://atomberg.com/).
+Homebridge plugin for [Atomberg](https://atomberg.com/) smart fans and lights, with LAN-first UDP control, full LED triad (on / brightness / colour temperature), single-tile Home app UI, command throttling, and Home Assistant coexistence.
 
 ## How it works
 
 The plugin uses the [Atomberg public APIs](https://developer.atomberg-iot.com/) for initial device discovery and as a fallback transport, and listens for the fan's UDP broadcasts on port 5625 for live state updates. When a fan's IP address is known from those broadcasts, **commands are sent directly to it on UDP/5600** instead of going through the cloud — this keeps the plugin well under Atomberg's 100 calls/day quota.
 
-Supported series (per the Atomberg developer docs and the upstream Home Assistant integration): R1, R2, K1, I1, I2, I3, M1, S1, S2. Brightness control is offered for I1/M1/S1/S2; color temperature for I1 (Aris Starlight). Speeds 1–6 are mapped onto HomeKit's 0–100 rotation slider.
+Supported series (per the Atomberg developer docs and the upstream Home Assistant integration): R1, R2, K1, I1, I2, I3, M1, S1, S2. Brightness control is offered for I1/M1/S1/S2; colour temperature for I1 (Aris Starlight). Speeds 1–6 are mapped onto HomeKit's 0–100 rotation slider; legacy 5-speed fans can opt in via `legacy5Speed: true` in config.
 
-### Home Assistant coexistence
+### What's different vs `homebridge-atomberg-fan*` on npm
 
-The UDP listener binds with `SO_REUSEADDR`, so the [`atomberg-integration`](https://github.com/dasshubham762/atomberg-integration) Home Assistant component can run on the same host and receive the same broadcasts. Both ecosystems can control the fans simultaneously without stepping on each other.
+- **LAN-first UDP control** with cloud-API fallback — minutes-old cloud caches stop being your source of truth.
+- **Single Home app tile per fan** (Fan v2 primary, LED Lightbulb linked) instead of two separate accessories.
+- **Command coalescing**: HomeKit slider drags collapse to one outbound call (250 ms debounce, last-write-wins per command key).
+- **Liveness watchdog**: device falls silent → tile flips to off in HomeKit; first beacon back → tile recovers immediately.
+- **Plain-JSON UDP** decoder in addition to hex-encoded — works with all firmware variants seen in the wild.
+- **Home Assistant coexistence** via `SO_REUSEADDR` — the [`atomberg-integration`](https://github.com/dasshubham762/atomberg-integration) HA component can run on the same host and receive the same broadcasts.
 
 ## Homebridge Setup
 
@@ -28,7 +31,7 @@ Go to Atomberg Home App and enable Developer Options to get your `API Key` and `
 
 ### Step 2: Install Plugin
 
-Go to your Homebrige UI and search for Atomberg Fan in the plugins section and select this plugin.
+In the Homebridge UI Plugins tab, search for `homebridge-atomberg-plugin` and install it. Or from the CLI: `npm install -g homebridge-atomberg-plugin`.
 
 ### Step 3: Configure
 
@@ -40,16 +43,19 @@ You can even enter the details directly to config file incase you aren't using U
   "platforms": [
     {
       "platform": "Atomberg Fan",
-      "name": "Homebridge Atomberg Fan",
+      "name": "Homebridge Atomberg",
       "apiKey": "tw******",
       "refreshToken": "ey******",
-      "useCloudOnly": false
+      "useCloudOnly": false,
+      "legacy5Speed": false
     }
   ]
 }
 ```
 
 `useCloudOnly` is optional (default `false`). Set it to `true` only if Homebridge can't reach your fans on the LAN (e.g. running in a Docker bridge network or on a different VLAN) — every command will then count against the cloud quota.
+
+`legacy5Speed` is optional (default `false`). Enable it for pre-2022 Renesa/Studio fans that only expose 5 speed levels — the HomeKit rotation slider will quantize to 1..5 instead of 1..6.
 
 ### Step 4: Why not?
 

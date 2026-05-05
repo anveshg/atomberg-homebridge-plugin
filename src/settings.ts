@@ -1,6 +1,10 @@
+// PLATFORM_NAME is the key used in /homebridge/config.json under "platforms[].platform".
+// Keep it stable across renames so existing installs don't lose their config block.
 export const PLATFORM_NAME = 'Atomberg Fan';
 
-export const PLUGIN_NAME = 'homebridge-atomberg-fan';
+// PLUGIN_NAME must match the npm package name exactly — Homebridge uses this when
+// it (un)registers cached accessories, and a mismatch silently drops the cache.
+export const PLUGIN_NAME = 'homebridge-atomberg-plugin';
 
 export const LOGIN_RETRY_DELAY = 360 * 1000;
 
@@ -44,9 +48,11 @@ export const BRIGHTNESS_SERIES: ReadonlyArray<string> = ['I1', 'M1', 'S1', 'S2']
 // Series whose lightbulb supports color modes. Only Aris Starlight (I1).
 export const COLOR_MODE_SERIES: ReadonlyArray<string> = ['I1'];
 
-// Atomberg accepts 1..6 fan speeds.
+// Atomberg accepts 1..6 fan speeds on current models. Older fans only expose
+// 1..5 — opt in via the `legacy5Speed` config flag and we'll clamp to 5.
 export const FAN_SPEED_MIN = 1;
 export const FAN_SPEED_MAX = 6;
+export const LEGACY_FAN_SPEED_MAX = 5;
 
 // Atomberg accepts 10..100 brightness per OpenAPI; the working HA integration uses
 // 1..100. We expose 1..100 to HomeKit and let the device handle low values, but
@@ -70,3 +76,13 @@ export const LIGHT_MODE_WARM = 'warm';
 // Treat a device as offline if no UDP broadcast/beacon was seen within this window.
 // Atomberg fans beacon every ~1s, so 30s is conservative.
 export const DEVICE_AVAILABILITY_TIMEOUT_MS = 30 * 1000;
+
+// How often the liveness watchdog runs. Cheap; just walks the routes map and
+// emits 'offline' for any device whose last broadcast is older than the timeout.
+export const LIVENESS_PROBE_INTERVAL_MS = 10 * 1000;
+
+// Coalesce HomeKit characteristic writes into one outbound command per device
+// per this window. HomeKit fires many events when the user drags a slider, and
+// the cloud API has a hard 100/day quota; deduping last-write-wins keeps us
+// well below it without sacrificing responsiveness on the LAN UDP path.
+export const COMMAND_DEBOUNCE_MS = 250;

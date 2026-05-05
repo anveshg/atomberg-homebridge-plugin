@@ -5,9 +5,11 @@ import { AtombergFanDeviceState } from './model';
 import {
   BRIGHTNESS_SERIES,
   COLOR_MODE_SERIES,
+  DEVICE_AVAILABILITY_TIMEOUT_MS,
   LIGHT_MODE_COOL,
   LIGHT_MODE_DAYLIGHT,
   LIGHT_MODE_WARM,
+  LIVENESS_PROBE_INTERVAL_MS,
   UDP_BROADCAST_PORT,
   UDP_COMMAND_PORT,
 } from './settings';
@@ -37,6 +39,10 @@ class BroadcastListener extends EventEmitter {
   private readonly socket: dgram.Socket;
   private readonly log: Logger;
   private readonly routes: Map<string, DeviceRoute> = new Map();
+  // Devices we've previously emitted 'offline' for. Avoids spamming the same
+  // event every probe tick while the device stays silent.
+  private readonly offlineSet: Set<string> = new Set();
+  private livenessTimer: NodeJS.Timeout | undefined;
   private bound = false;
 
   private constructor(log: Logger) {
@@ -68,6 +74,12 @@ class BroadcastListener extends EventEmitter {
       this.log.error('UDP socket error: ', err);
     });
     this.socket.bind(UDP_BROADCAST_PORT);
+
+    this.livenessTimer = setInterval(() => this.runLivenessProbe(), LIVENESS_PROBE_INTERVAL_MS);
+    // Don't keep the Homebridge process alive just to run this probe.
+    if (typeof this.livenessTimer.unref === 'function') {
+      this.livenessTimer.unref();
+    }
   }
 
   public close(): void {
@@ -75,10 +87,34 @@ class BroadcastListener extends EventEmitter {
       return;
     }
     this.bound = false;
+    if (this.livenessTimer) {
+      clearInterval(this.livenessTimer);
+      this.livenessTimer = undefined;
+    }
     try {
       this.socket.close();
     } catch (e) {
       this.log.debug('Error closing UDP socket: ', e);
+    }
+  }
+
+  /**
+   * Sweep the routes map and emit 'offline' for any device whose last UDP
+   * traffic is older than DEVICE_AVAILABILITY_TIMEOUT_MS. Re-emit 'online' once
+   * fresh traffic arrives. Cheap — runs every LIVENESS_PROBE_INTERVAL_MS.
+   */
+  private runLivenessProbe(): void {
+    const now = Date.now();
+    for (const [deviceId, route] of this.routes) {
+      const stale = now - route.lastSeen > DEVICE_AVAILABILITY_TIMEOUT_MS;
+      const wasOffline = this.offlineSet.has(deviceId);
+      if (stale && !wasOffline) {
+        this.offlineSet.add(deviceId);
+        this.log.debug(`Device ${deviceId} offline (no UDP traffic for ${Math.round((now - route.lastSeen) / 1000)}s)`);
+        this.emit('offline', { device_id: deviceId });
+      } else if (!stale && wasOffline) {
+        this.offlineSet.delete(deviceId);
+      }
     }
   }
 
@@ -124,20 +160,33 @@ class BroadcastListener extends EventEmitter {
       return;
     }
 
-    // State message: hex-encoded JSON.
-    try {
-      const json = Buffer.from(text, 'hex').toString('utf8');
-      const parsed = JSON.parse(json) as { device_id?: string; state_string?: string };
-      if (!parsed.device_id) {
+    // State message. Payload is *usually* hex-encoded JSON, but some firmware
+    // versions send plain JSON directly. Try plain first when it looks like
+    // JSON, then fall through to hex decoding.
+    let parsed: { device_id?: string; state_string?: string } | null = null;
+    if (text.startsWith('{')) {
+      try {
+        parsed = JSON.parse(text);
+      } catch {
+        parsed = null;
+      }
+    }
+    if (!parsed) {
+      try {
+        const json = Buffer.from(text, 'hex').toString('utf8');
+        parsed = JSON.parse(json);
+      } catch (err) {
+        this.log.debug(`Failed to parse UDP message from ${remote.address}: ${(err as Error).message}`);
         return;
       }
-      this.touchRoute(parsed.device_id, remote.address, null);
-      const state = this.decodeStateString(parsed.device_id, parsed.state_string);
-      if (state) {
-        this.emit('stateChange', state);
-      }
-    } catch (err) {
-      this.log.debug(`Failed to parse UDP message from ${remote.address}: ${(err as Error).message}`);
+    }
+    if (!parsed?.device_id) {
+      return;
+    }
+    this.touchRoute(parsed.device_id, remote.address, null);
+    const state = this.decodeStateString(parsed.device_id, parsed.state_string);
+    if (state) {
+      this.emit('stateChange', state);
     }
   }
 
@@ -160,6 +209,10 @@ class BroadcastListener extends EventEmitter {
       series: series ?? existing?.series ?? null,
       lastSeen: Date.now(),
     });
+    if (this.offlineSet.delete(deviceId)) {
+      this.log.debug(`Device ${deviceId} back online`);
+      this.emit('recovered', { device_id: deviceId });
+    }
   }
 
   /**

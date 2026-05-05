@@ -6,6 +6,10 @@ export interface AtombergFanPlatformConfig extends PlatformConfig {
     // When true, never attempt LAN UDP commands; always go through the cloud API.
     // Useful if Homebridge can't see the fans' subnet (VLANs, Docker bridge, etc.).
     useCloudOnly?: boolean;
+    // Legacy Atomberg fans (pre-2022 Renesa/Studio) only expose speeds 1..5. Enable
+    // this to clamp the HomeKit slider to a 1..5 mapping — sending speed=6 to a
+    // 5-speed fan no-ops on the device but burns API quota.
+    legacy5Speed?: boolean;
 }
 
 export interface AtombergFanDevice {

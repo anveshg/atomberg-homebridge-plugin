@@ -1,23 +1,19 @@
 {
   "private": false,
-  "displayName": "Homebridge Atomberg Fan",
-  "name": "homebridge-atomberg-fan",
-  "version": "1.0.0",
-  "description": "Homebridge platform plugin providing HomeKit support for Atomberg Smart Fans.",
+  "displayName": "Atomberg",
+  "name": "homebridge-atomberg-plugin",
+  "version": "1.1.0",
+  "description": "Homebridge plugin for Atomberg smart fans and lights — LAN-first UDP control, full LED triad (on/brightness/colour temp), single-tile Home app UI, command throttling, and Home Assistant coexistence.",
   "license": "Apache-2.0",
-  "author": "Sangwan5688",
+  "author": "anveshg <anvesh.g90@gmail.com>",
   "repository": {
     "type": "git",
-    "url": "git+https://github.com/Sangwan5688/homebridge-atomberg-fan.git"
+    "url": "git+https://github.com/anveshg/atomberg-homebridge-plugin.git"
   },
   "bugs": {
-    "url": "https://github.com/Sangwan5688/homebridge-atomberg-fan/issues"
+    "url": "https://github.com/anveshg/atomberg-homebridge-plugin/issues"
   },
-  "homepage": "https://github.com/Sangwan5688/homebridge-atomberg-fan#readme",
-  "funding": {
-    "type": "github",
-    "url": "https://github.com/sponsors/Sangwan5688"
-  },
+  "homepage": "https://github.com/anveshg/atomberg-homebridge-plugin#readme",
   "engines": {
     "node": ">=18.0.0",
     "homebridge": ">=1.6.0"
@@ -35,12 +31,17 @@
   "keywords": [
     "homebridge",
     "homebridge-plugin",
-    "homebridge-atomberg-fan",
+    "homebridge-atomberg",
+    "homebridge-atomberg-plugin",
     "homekit",
     "atomberg",
     "renesa",
+    "aris",
+    "studio",
     "fan",
-    "smart fan"
+    "smart fan",
+    "smart light",
+    "lan-control"
   ],
   "dependencies": {
     "axios": "^1.7.7"

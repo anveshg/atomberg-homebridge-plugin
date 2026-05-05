@@ -82,6 +82,23 @@ export class AtombergFanPlatform implements DynamicPlatformPlugin {
         accessoryInstance.markOnline();
       }
     });
+
+    // Liveness watchdog: when a device falls silent for longer than the
+    // availability timeout, flip its accessory offline so HomeKit shows the
+    // greyed-out state instead of stale "on at speed 3".
+    this.broadcastListener.on('offline', (msg: { device_id: string }) => {
+      const accessoryInstance = this.accessoryInstances.get(msg.device_id);
+      if (accessoryInstance) {
+        accessoryInstance.markOffline();
+      }
+    });
+
+    this.broadcastListener.on('recovered', (msg: { device_id: string }) => {
+      const accessoryInstance = this.accessoryInstances.get(msg.device_id);
+      if (accessoryInstance) {
+        accessoryInstance.markOnline();
+      }
+    });
   }
 
   configureAccessory(accessory: PlatformAccessory) {
