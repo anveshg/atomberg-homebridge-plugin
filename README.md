@@ -12,7 +12,13 @@ Homebridge Atomberg Fan is a plugin for [Homebridge](https://homebridge.io/) tha
 
 ## How it works
 
-The plugin makes use of [Atomberg public APIs](https://developer.atomberg-iot.com/#overview) to fetch and control your device using the API calls. The plugin also listen to broadcasts on your network to update device state without making unnecessary api calls. All devices that are set up on your Atomberg account will appear in your Home app. If you remove a device from your account, it will also disappear from your Home app after you restart Homebridge.
+The plugin uses the [Atomberg public APIs](https://developer.atomberg-iot.com/) for initial device discovery and as a fallback transport, and listens for the fan's UDP broadcasts on port 5625 for live state updates. When a fan's IP address is known from those broadcasts, **commands are sent directly to it on UDP/5600** instead of going through the cloud — this keeps the plugin well under Atomberg's 100 calls/day quota.
+
+Supported series (per the Atomberg developer docs and the upstream Home Assistant integration): R1, R2, K1, I1, I2, I3, M1, S1, S2. Brightness control is offered for I1/M1/S1/S2; color temperature for I1 (Aris Starlight). Speeds 1–6 are mapped onto HomeKit's 0–100 rotation slider.
+
+### Home Assistant coexistence
+
+The UDP listener binds with `SO_REUSEADDR`, so the [`atomberg-integration`](https://github.com/dasshubham762/atomberg-integration) Home Assistant component can run on the same host and receive the same broadcasts. Both ecosystems can control the fans simultaneously without stepping on each other.
 
 ## Homebridge Setup
 
@@ -37,10 +43,13 @@ You can even enter the details directly to config file incase you aren't using U
       "name": "Homebridge Atomberg Fan",
       "apiKey": "tw******",
       "refreshToken": "ey******",
+      "useCloudOnly": false
     }
   ]
 }
 ```
+
+`useCloudOnly` is optional (default `false`). Set it to `true` only if Homebridge can't reach your fans on the LAN (e.g. running in a Docker bridge network or on a different VLAN) — every command will then count against the cloud quota.
 
 ### Step 4: Why not?
 

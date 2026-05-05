@@ -2,20 +2,47 @@ import dgram from 'dgram';
 import { Logger } from 'homebridge';
 import { EventEmitter } from 'events';
 import { AtombergFanDeviceState } from './model';
+import {
+  BRIGHTNESS_SERIES,
+  COLOR_MODE_SERIES,
+  LIGHT_MODE_COOL,
+  LIGHT_MODE_DAYLIGHT,
+  LIGHT_MODE_WARM,
+  UDP_BROADCAST_PORT,
+  UDP_COMMAND_PORT,
+} from './settings';
+
+interface DeviceRoute {
+  ip: string;
+  series: string | null;
+  lastSeen: number;
+}
 
 /**
  * BroadcastListener
- * This class is responsible for listening to broadcast messages from the Atomberg Fan devices.
+ *
+ * Listens for UDP traffic from Atomberg fans on UDP/5625:
+ *   - Beacons (~1/s, short ASCII "<mac>_<series>") — used for IP discovery only.
+ *   - State messages (hex-encoded JSON with `state_string`) — decoded to update
+ *     HomeKit characteristics without burning cloud-API quota.
+ *
+ * Also exposes sendLocalCommand() so the rest of the plugin can target a fan
+ * directly on UDP/5600 instead of going through the cloud.
+ *
+ * The socket binds with reuseAddr so a Home Assistant instance on the same host
+ * (which uses the same broadcast port) can listen alongside Homebridge.
  */
 class BroadcastListener extends EventEmitter {
   private static instance: BroadcastListener;
-  public readonly socket = dgram.createSocket('udp4');
-  private readonly bindPort = 5625;
+  private readonly socket: dgram.Socket;
   private readonly log: Logger;
+  private readonly routes: Map<string, DeviceRoute> = new Map();
+  private bound = false;
 
   private constructor(log: Logger) {
     super();
     this.log = log;
+    this.socket = dgram.createSocket({ type: 'udp4', reuseAddr: true });
   }
 
   public static getInstance(log: Logger): BroadcastListener {
@@ -25,70 +52,178 @@ class BroadcastListener extends EventEmitter {
     return BroadcastListener.instance;
   }
 
-  private onListen() {
-    const address = this.socket.address();
-    this.log.debug('UDP socket listening on ' + address.address + ':' + address.port);
+  public listen(): void {
+    if (this.bound) {
+      return;
+    }
+    this.bound = true;
+
+    this.log.debug(`Listening for Atomberg broadcasts on UDP/${UDP_BROADCAST_PORT}`);
+    this.socket.on('listening', () => {
+      const addr = this.socket.address();
+      this.log.debug(`UDP socket listening on ${addr.address}:${addr.port}`);
+    });
+    this.socket.on('message', this.onMessage.bind(this));
+    this.socket.on('error', (err) => {
+      this.log.error('UDP socket error: ', err);
+    });
+    this.socket.bind(UDP_BROADCAST_PORT);
   }
 
-  private onMessage(message: Buffer, remote: dgram.RemoteInfo) {
-    if (remote.size > 100) {
-      try {
-        const res = this.parseMessage(message) as AtombergFanDeviceState;
-        this.log.debug('Received message from ' + remote.address + ':' + remote.port + ' - ' + JSON.stringify(res));
-        if (res) {
-          this.emit('stateChange', res);
-        }
-      } catch (error) {
-        this.log.error('Error parsing broadcast message: ', error);
-      }
+  public close(): void {
+    if (!this.bound) {
+      return;
+    }
+    this.bound = false;
+    try {
+      this.socket.close();
+    } catch (e) {
+      this.log.debug('Error closing UDP socket: ', e);
     }
   }
 
-  private parseMessage(message: Buffer): AtombergFanDeviceState | null {
+  /** Last known LAN IP for a device, or null if we haven't heard a beacon yet. */
+  public getDeviceIp(deviceId: string): string | null {
+    return this.routes.get(deviceId)?.ip ?? null;
+  }
+
+  /**
+   * Fire-and-forget UDP command on port 5600 per Atomberg's local-control docs.
+   * Returns true if the datagram was handed off to the OS (no app-level ack
+   * exists). Callers should fall back to the cloud API on false.
+   */
+  public sendLocalCommand(deviceId: string, command: object): Promise<boolean> {
+    const route = this.routes.get(deviceId);
+    if (!route) {
+      return Promise.resolve(false);
+    }
+    if (!this.bound) {
+      return Promise.resolve(false);
+    }
+
+    const payload = Buffer.from(JSON.stringify(command), 'utf8');
+    return new Promise<boolean>((resolve) => {
+      this.socket.send(payload, UDP_COMMAND_PORT, route.ip, (err) => {
+        if (err) {
+          this.log.debug(`Local UDP command to ${deviceId} (${route.ip}) failed: ${err.message}`);
+          resolve(false);
+          return;
+        }
+        this.log.debug(`Local UDP command to ${deviceId} (${route.ip}): ${JSON.stringify(command)}`);
+        resolve(true);
+      });
+    });
+  }
+
+  private onMessage(message: Buffer, remote: dgram.RemoteInfo): void {
+    const text = message.toString('utf8');
+
+    // Beacon: short ASCII "<mac>_<series>". Use to learn IPs.
+    if (text.length <= 32 && /^[0-9a-fA-F]{12}(_[A-Za-z0-9]+)?\s*$/.test(text)) {
+      this.handleBeacon(text.trim(), remote.address);
+      return;
+    }
+
+    // State message: hex-encoded JSON.
     try {
-      const hexString = message.toString();
-      const stringMessage = Buffer.from(hexString, 'hex').toString('utf8');
-      const jsonMessage = JSON.parse(stringMessage);
-      const stateCode = jsonMessage['state_string'].split(',')[0];
+      const json = Buffer.from(text, 'hex').toString('utf8');
+      const parsed = JSON.parse(json) as { device_id?: string; state_string?: string };
+      if (!parsed.device_id) {
+        return;
+      }
+      this.touchRoute(parsed.device_id, remote.address, null);
+      const state = this.decodeStateString(parsed.device_id, parsed.state_string);
+      if (state) {
+        this.emit('stateChange', state);
+      }
+    } catch (err) {
+      this.log.debug(`Failed to parse UDP message from ${remote.address}: ${(err as Error).message}`);
+    }
+  }
 
-      const power = ((0x10) & stateCode) > 0 ? true : false;
-      const led = ((0x20) & stateCode) > 0 ? true : false;
-      const sleep = ((0x80) & stateCode) > 0 ? true : false;
-      const speed = (0x07) & stateCode;
-      const fanTimer = ((0x0F0000 & stateCode) / 65536);
-      const fanTimerElapsedMins = ((0xFF000000 & stateCode) * 4 / 16777216);
-      // Aris Starlight Specific
-      const brightness = (((0x7F00) & stateCode) / 256);
-      const cool = ((0x08) & stateCode) > 0 ? true : false;
-      const warm = ((0x8000) & stateCode) > 0 ? true : false;
+  private handleBeacon(payload: string, ip: string): void {
+    const [deviceId, series] = payload.split('_');
+    if (!deviceId) {
+      return;
+    }
+    this.touchRoute(deviceId, ip, series ?? null);
+    this.emit('beacon', { device_id: deviceId, ip, series: series ?? null });
+  }
 
-      return {
-        'device_id': jsonMessage['device_id'],
-        'is_online': true,
-        'power': power,
-        'led': led,
-        'sleep_mode': sleep,
-        'last_recorded_speed': speed,
-        'timer_hours': fanTimer,
-        'timer_time_elapsed_mins': fanTimerElapsedMins,
-        'last_recorded_brightness': brightness,  // aris starlight only
-        'last_recorded_color': cool ? (warm ? 'Daylight' : 'Cool') : 'Warm',  // aris starlight only
-      } as AtombergFanDeviceState;
-    } catch (error) {
-      this.log.error('Error parsing broadcast message: ', error);
+  private touchRoute(deviceId: string, ip: string, series: string | null): void {
+    const existing = this.routes.get(deviceId);
+    if (!existing || existing.ip !== ip || (series && existing.series !== series)) {
+      this.log.debug(`Routing for ${deviceId}: ip=${ip}${series ? `, series=${series}` : ''}`);
+    }
+    this.routes.set(deviceId, {
+      ip,
+      series: series ?? existing?.series ?? null,
+      lastSeen: Date.now(),
+    });
+  }
+
+  /**
+   * Decode the first comma-separated field of `state_string`, which is a
+   * decimal-encoded bitfield. The exact bit layout is documented at
+   * https://developer.atomberg-iot.com/ under "Get Device State".
+   *
+   * Implementation follows the Home Assistant integration's decoder, with
+   * unsigned right-shifts so timer-elapsed minutes don't underflow when the
+   * top bit of the 32-bit value is set.
+   */
+  private decodeStateString(deviceId: string, stateString: string | undefined): AtombergFanDeviceState | null {
+    if (!stateString) {
       return null;
     }
-  }
+    const head = stateString.split(',')[0]?.trim();
+    if (!head || !/^\d+$/.test(head)) {
+      return null;
+    }
+    const value = parseInt(head, 10);
+    if (!Number.isFinite(value)) {
+      return null;
+    }
 
-  public listen() {
-    this.log.debug('Listening for broadcast messages on port ' + this.bindPort);
-    this.socket.bind(this.bindPort);
-    this.socket.on('listening', this.onListen.bind(this));
-    this.socket.on('message', this.onMessage.bind(this));
-  }
+    const power = (value & 0x10) > 0;
+    const led = (value & 0x20) > 0;
+    const sleep = (value & 0x80) > 0;
+    const speed = value & 0x07;
+    const timerHours = (value & 0x0F0000) >>> 16;
+    // Top byte holds elapsed-minutes / 4. Use unsigned shift so values with
+    // the high bit set don't go negative.
+    const timerElapsedMins = ((value & 0xFF000000) >>> 24) * 4;
 
-  public close() {
-    this.socket.close();
+    const series = this.routes.get(deviceId)?.series ?? null;
+    const supportsBrightness = series ? BRIGHTNESS_SERIES.includes(series) : true;
+    const supportsColor = series ? COLOR_MODE_SERIES.includes(series) : true;
+
+    const state: AtombergFanDeviceState = {
+      device_id: deviceId,
+      is_online: true,
+      power,
+      led,
+      sleep_mode: sleep,
+      last_recorded_speed: speed,
+      timer_hours: timerHours,
+      timer_time_elapsed_mins: timerElapsedMins,
+    };
+
+    if (supportsBrightness) {
+      state.last_recorded_brightness = (value & 0x7F00) >>> 8;
+    }
+    if (supportsColor) {
+      const cool = (value & 0x08) > 0;
+      const warm = (value & 0x8000) > 0;
+      if (cool && warm) {
+        state.last_recorded_color = LIGHT_MODE_DAYLIGHT;
+      } else if (cool) {
+        state.last_recorded_color = LIGHT_MODE_COOL;
+      } else {
+        state.last_recorded_color = LIGHT_MODE_WARM;
+      }
+    }
+
+    return state;
   }
 }
 

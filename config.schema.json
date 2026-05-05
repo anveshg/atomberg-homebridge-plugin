@@ -16,13 +16,21 @@
         "title": "API Key",
         "type": "string",
         "placeholder": "API Key",
-        "required": true
+        "required": true,
+        "description": "Generated in the Atomberg Home app under Developer Options."
       },
       "refreshToken": {
         "title": "Refresh Token",
         "type": "string",
         "placeholder": "Refresh Token",
-        "required": true
+        "required": true,
+        "description": "Generated in the Atomberg Home app under Developer Options."
+      },
+      "useCloudOnly": {
+        "title": "Use cloud API only",
+        "type": "boolean",
+        "default": false,
+        "description": "By default the plugin sends commands directly to the fan over your LAN (UDP/5600) when reachable, and only falls back to the cloud API. Enable this if Homebridge can't see the fans' subnet (Docker bridge networking, VLAN isolation, etc.) — every command will then count against the 100 calls/day Atomberg quota."
       }
     }
   },
@@ -30,23 +38,22 @@
     {
       "type": "flex",
       "flex-flow": "row wrap",
-      "items": [
-        "name"
-      ]
+      "items": ["name"]
     },
     {
       "type": "flex",
       "flex-flow": "row wrap",
-      "items": [
-        "apiKey"
-      ]
+      "items": ["apiKey"]
     },
     {
       "type": "flex",
       "flex-flow": "row wrap",
-      "items": [
-        "refreshToken"
-      ]
+      "items": ["refreshToken"]
+    },
+    {
+      "type": "flex",
+      "flex-flow": "row wrap",
+      "items": ["useCloudOnly"]
     }
   ]
 }

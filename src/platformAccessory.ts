@@ -1,17 +1,37 @@
-import { Service, PlatformAccessory, CharacteristicValue, HAPStatus } from 'homebridge';
+import { CharacteristicValue, HAPStatus, PlatformAccessory, Service } from 'homebridge';
 
 import AtombergApi from './atombergApi';
 import { AtombergFanPlatform } from './platform';
-import { AtombergFanCommandData, AtombergFanDeviceState } from './model';
+import { AtombergFanCommand, AtombergFanCommandData, AtombergFanDeviceState } from './model';
+import {
+  BRIGHTNESS_MAX,
+  BRIGHTNESS_MIN,
+  BRIGHTNESS_SERIES,
+  COLOR_MODE_SERIES,
+  COLOR_TEMP_COOL_MIRED,
+  COLOR_TEMP_DAYLIGHT_MIRED,
+  COLOR_TEMP_WARM_MIRED,
+  FAN_SPEED_MAX,
+  FAN_SPEED_MIN,
+  LIGHT_MODE_COOL,
+  LIGHT_MODE_DAYLIGHT,
+  LIGHT_MODE_WARM,
+} from './settings';
 
 /**
- * Platform Accessory
- * An instance of this class is created for each accessory your platform registers
- * Each accessory may expose multiple services of different service types.
+ * One AtombergFanPlatformAccessory instance per fan. Owns the Fanv2 service
+ * and the accompanying Lightbulb service for the LED, registers HomeKit set
+ * handlers, and reflects state changes pushed up from the UDP listener.
+ *
+ * Cloud API quota note: every set handler dispatches via sendDeviceUpdate,
+ * which prefers the LAN UDP path when the broadcast listener has discovered
+ * the device's IP. The cloud API is only used as a fallback.
  */
 export class AtombergFanPlatformAccessory {
   private fanService: Service;
   private lightbulbService: Service;
+  private readonly supportsBrightness: boolean;
+  private readonly supportsColor: boolean;
 
   constructor(
     private readonly platform: AtombergFanPlatform,
@@ -19,250 +39,270 @@ export class AtombergFanPlatformAccessory {
     private readonly accessory: PlatformAccessory,
     private fanState: AtombergFanDeviceState,
   ) {
-
-    let modelName = accessory.context.device.model || '';
-    if (accessory.context.device.series) {
-      if (modelName !== '') {
-        modelName += ' ';
-      }
-      modelName += accessory.context.device.series;
-    } else if (modelName === '') {
-      modelName = 'Unknown';
+    // Tolerate the cloud state lookup not returning a row for this device
+    // (offline at boot is common). Subsequent UDP messages will fill it in.
+    if (!this.fanState) {
+      this.fanState = {
+        device_id: accessory.context.device.device_id,
+        is_online: false,
+        power: false,
+        led: false,
+        sleep_mode: false,
+        last_recorded_speed: 0,
+        timer_hours: 0,
+        timer_time_elapsed_mins: 0,
+      };
     }
 
-    // set accessory information
+    const series: string = accessory.context.device.series ?? '';
+    const model: string = accessory.context.device.model ?? '';
+    this.supportsBrightness = BRIGHTNESS_SERIES.includes(series);
+    this.supportsColor = COLOR_MODE_SERIES.includes(series);
+
+    const modelName = [model, series].filter(Boolean).join(' ') || 'Unknown';
+
     this.accessory.getService(this.platform.Service.AccessoryInformation)!
       .setCharacteristic(this.platform.Characteristic.Manufacturer, 'Atomberg')
       .setCharacteristic(this.platform.Characteristic.Model, modelName)
       .setCharacteristic(this.platform.Characteristic.Name, accessory.context.device.name || 'Unknown')
-      .setCharacteristic(this.platform.Characteristic.SerialNumber, 'Unknown');
+      .setCharacteristic(this.platform.Characteristic.SerialNumber, accessory.context.device.device_id || 'Unknown');
 
-    // get the Fan service if it exists, otherwise create a new Fan service
-    // you can create multiple services for each accessory
-    this.fanService = this.accessory.getService(this.platform.Service.Fanv2) || this.accessory.addService(this.platform.Service.Fanv2);
-
-    // set the service name, this is what is displayed as the default name on the Home app
-    // in this example we are using the name we stored in the `accessory.context` in the `discoverDevices` method.
+    // Fan service
+    this.fanService = this.accessory.getService(this.platform.Service.Fanv2)
+      || this.accessory.addService(this.platform.Service.Fanv2);
     this.fanService.setCharacteristic(this.platform.Characteristic.Name, accessory.context.device.name || 'Unknown Fan');
 
-    // each service must implement at-minimum the "required characteristics" for the given service type
-    // see https://developers.homebridge.io/#/service/Lightbulb
-
-    // register handlers for the Active Characteristic (required)
     this.fanService.getCharacteristic(this.platform.Characteristic.Active)
-      .onSet(this.setActive.bind(this));                // SET - bind to the `setOn` method below
-    // .onGet(this.getActive.bind(this));              // GET - bind to the `getOn` method below
-    // We don't need onGet as we will be updating status via broadcast listener
+      .onSet(this.setActive.bind(this));
 
-
-    // register handlers for the Speed Characteristic
+    // Atomberg supports speeds 1..6. We expose a continuous 0..100 slider so
+    // HomeKit's UX is unchanged; sets quantize to the nearest speed level and
+    // reads quantize back to a representative percentage.
     this.fanService.getCharacteristic(this.platform.Characteristic.RotationSpeed)
-      .setProps({
-        minValue: 0,
-        maxValue: 100,
-        minStep: 20,
-      })
+      .setProps({ minValue: 0, maxValue: 100, minStep: 1 })
       .onSet(this.setRotationSpeed.bind(this));
 
-    this.lightbulbService = this.accessory.getService(this.platform.Service.Lightbulb) ||
-    this.accessory.addService(this.platform.Service.Lightbulb);
+    // Lightbulb service (LED)
+    this.lightbulbService = this.accessory.getService(this.platform.Service.Lightbulb)
+      || this.accessory.addService(this.platform.Service.Lightbulb);
+    this.lightbulbService.setCharacteristic(
+      this.platform.Characteristic.Name,
+      `${accessory.context.device.name || 'Unknown'} LED`,
+    );
 
-    // Lightbulb Service Name
-    this.lightbulbService.setCharacteristic(this.platform.Characteristic.Name, accessory.context.device.name + ' LED' || 'Unknown LED');
-
-    // Lightbulb Characteristic: On
     this.lightbulbService.getCharacteristic(this.platform.Characteristic.On)
       .onSet(this.setLED.bind(this));
 
-    const devicesSeries = accessory.context.device.series;
-
-    // Lightbulb Characteristic Brightness for I1 or M1 series
-    if (devicesSeries === 'I1' || devicesSeries === 'M1') {
+    if (this.supportsBrightness) {
       this.lightbulbService.getCharacteristic(this.platform.Characteristic.Brightness)
-        .setProps({
-          minValue: 0,
-          maxValue: 100,
-          minStep: 1,
-        })
+        .setProps({ minValue: 0, maxValue: 100, minStep: 1 })
         .onSet(this.setLEDBrightness.bind(this));
     }
 
-    // Lightbulb Characteristic Temperature for I1 series
-    if (devicesSeries === 'I1') {
+    if (this.supportsColor) {
+      // HomeKit ColorTemperature is in mireds. Atomberg has 3 modes — we span
+      // cool..warm (154..370 mired) and quantize on set.
       this.lightbulbService.getCharacteristic(this.platform.Characteristic.ColorTemperature)
-        .setProps({
-          minValue: 300,
-          maxValue: 500,
-          minStep: 100,
-        })
+        .setProps({ minValue: COLOR_TEMP_COOL_MIRED, maxValue: COLOR_TEMP_WARM_MIRED, minStep: 1 })
         .onSet(this.setLEDTemperature.bind(this));
     }
 
     this.refreshDeviceStatus(this.fanState);
-
   }
 
-  /**
-   * Handle "SET" requests from HomeKit
-   * These are sent when the user changes the state of fan i.e, turning the fan on/off.
-   */
-  async setActive(value: CharacteristicValue) {
-    this.validateDeviceConnectionStatus();
-
-    this.fanState.power = value as boolean;
-
-    this.platform.log.debug('Set Characteristic Active ->', value);
-    const powerState = value === this.platform.Characteristic.Active.ACTIVE;
-    const cmdData = {
-      'device_id': this.accessory.context.device.device_id,
-      'command': {'power': powerState, 'speed': powerState ? this.fanState.last_recorded_speed : 0},
-    } as AtombergFanCommandData;
-    this.sendDeviceUpdate(cmdData);
+  async setActive(value: CharacteristicValue): Promise<void> {
+    this.assertOnline();
+    const powerOn = value === this.platform.Characteristic.Active.ACTIVE;
+    this.fanState.power = powerOn;
+    this.platform.log.debug(`Set Active -> ${powerOn}`);
+    await this.sendDeviceUpdate({ power: powerOn });
   }
 
+  async setRotationSpeed(value: CharacteristicValue): Promise<void> {
+    this.assertOnline();
+    const pct = value as number;
 
-  private validateDeviceConnectionStatus() {
-    if (!this.fanState.is_online) {
-      this.platform.log.info('Device is offline, unable to update device characteristic value');
-      throw new this.platform.api.hap.HapStatusError(HAPStatus.SERVICE_COMMUNICATION_FAILURE);
-    }
-  }
-
-  // Send device update to Atomberg API
-  private async sendDeviceUpdate(commandData: AtombergFanCommandData) {
-    this.validateDeviceConnectionStatus();
-
-    try {
-      this.platform.log.debug('Sending command data: ', commandData);
-      const res = await this.atombergApi.sendCommand(commandData);
-      if (res) {
-        this.platform.log.debug(`Successfully sent device update for device ['${this.accessory.displayName}']`);
-      }
-    } catch (error) {
-      this.platform.log.error('An error occurred while sending a device update. ' +
-            'Turn on debug mode for more information.');
-
-      // Only log if a Promise rejection reason was provided.
-      // Some errors are already logged at source.
-      if (error) {
-        this.platform.log.debug(JSON.stringify(error));
-      }
-    }
-  }
-
-
-  /**
-   * Handle "SET" requests from HomeKit
-   * These are sent when the user changes the spped of the fan
-   */
-  async setRotationSpeed(value: CharacteristicValue) {
-    this.validateDeviceConnectionStatus();
-
-    // implement your own code to set the brightness
-    const newSpeed = (value as number)/20;
-    this.fanState.last_recorded_speed = newSpeed;
-
-    this.platform.log.debug('Set Characteristic Speed -> ', newSpeed);
-    const cmdData = {
-      'device_id': this.accessory.context.device.device_id,
-      'command': {'speed': newSpeed},
-    } as AtombergFanCommandData;
-    this.sendDeviceUpdate(cmdData);
-  }
-
-  /**
-   * Handle "SET" requests from HomeKit
-   * These are sent when the user changes the state of LED of the fan i.e, turning the LED on/off.
-   */
-  async setLED(value: CharacteristicValue) {
-    this.validateDeviceConnectionStatus();
-
-    const newLED = value as boolean;
-    this.fanState.led = newLED;
-
-    this.platform.log.debug('Set Characteristic LED -> ', newLED);
-    const cmdData = {
-      'device_id': this.accessory.context.device.device_id,
-      'command': {'led': newLED},
-    } as AtombergFanCommandData;
-    this.sendDeviceUpdate(cmdData);
-  }
-
-  async setLEDBrightness(value: CharacteristicValue) {
-    this.validateDeviceConnectionStatus();
-
-    const newBrightness = value as number;
-    this.fanState.last_recorded_brightness = newBrightness;
-
-    this.platform.log.debug('Set Characteristic LED Brightness -> ', newBrightness);
-    const cmdData = {
-      'device_id': this.accessory.context.device.device_id,
-      'command': {'brightness': newBrightness},
-    } as AtombergFanCommandData;
-    this.sendDeviceUpdate(cmdData);
-  }
-
-  async setLEDTemperature(value: CharacteristicValue) {
-    this.validateDeviceConnectionStatus();
-
-    const newMired = value as number;
-    let newColorMode: string;
-    if (newMired >= 450) {
-      newColorMode = 'warm';
-    } else if (newMired >= 350 && newMired < 450) {
-      newColorMode = 'daylight';
-    } else {
-      newColorMode = 'cool';
+    if (pct <= 0) {
+      // HomeKit slid to 0 — treat as power-off rather than sending speed=0,
+      // which is outside Atomberg's documented 1..6 range.
+      this.fanState.power = false;
+      this.platform.log.debug('Set RotationSpeed -> 0 (interpreted as power off)');
+      await this.sendDeviceUpdate({ power: false });
+      return;
     }
 
-    this.fanState.last_recorded_color = newColorMode;
+    const speed = percentageToSpeed(pct);
+    this.fanState.last_recorded_speed = speed;
+    this.fanState.power = true;
+    this.platform.log.debug(`Set RotationSpeed -> ${pct}% (speed ${speed})`);
+    await this.sendDeviceUpdate({ speed });
+  }
 
-    this.platform.log.debug('Set Characteristic LED Color Mode -> ', newColorMode);
-    const cmdData = {
-      'device_id': this.accessory.context.device.device_id,
-      'command': {'light_mode': newColorMode},
-    } as AtombergFanCommandData;
-    this.sendDeviceUpdate(cmdData);
+  async setLED(value: CharacteristicValue): Promise<void> {
+    this.assertOnline();
+    const on = value as boolean;
+    this.fanState.led = on;
+    this.platform.log.debug(`Set LED -> ${on}`);
+    await this.sendDeviceUpdate({ led: on });
+  }
+
+  async setLEDBrightness(value: CharacteristicValue): Promise<void> {
+    this.assertOnline();
+    let pct = value as number;
+    if (pct <= 0) {
+      // Brightness 0 from HomeKit is the slider hitting bottom — turn LED off.
+      this.fanState.led = false;
+      this.platform.log.debug('Set Brightness -> 0 (interpreted as LED off)');
+      await this.sendDeviceUpdate({ led: false });
+      return;
+    }
+    pct = clamp(pct, BRIGHTNESS_MIN, BRIGHTNESS_MAX);
+    this.fanState.last_recorded_brightness = pct;
+    this.fanState.led = true;
+    this.platform.log.debug(`Set Brightness -> ${pct}`);
+    // Per Atomberg docs the device auto-turns LED on when given a brightness
+    // value, so we don't need to send {led: true} alongside.
+    await this.sendDeviceUpdate({ brightness: pct });
+  }
+
+  async setLEDTemperature(value: CharacteristicValue): Promise<void> {
+    this.assertOnline();
+    const mode = miredToLightMode(value as number);
+    this.fanState.last_recorded_color = mode;
+    this.platform.log.debug(`Set ColorTemperature -> ${value} mired (${mode})`);
+    await this.sendDeviceUpdate({ light_mode: mode });
   }
 
   /**
-   * This method is called when the device state is updated by the broadcast listener
+   * Push a fresh state snapshot from the broadcast listener back to HomeKit.
+   * Updates every characteristic the device supports — earlier versions only
+   * updated Active and RotationSpeed, which left the lightbulb out of sync
+   * after manual fan-control changes.
    */
   public refreshDeviceStatus(deviceState: AtombergFanDeviceState): void {
+    if (!deviceState) {
+      return;
+    }
+    this.fanState = deviceState;
+
+    if (!deviceState.is_online) {
+      this.platform.log.debug(`Device ['${this.accessory.displayName}'] offline; skipping refresh`);
+      return;
+    }
+
     try {
-      // Skipping refresh
-      if (!deviceState.is_online) {
-        this.platform.log.debug(`Device ['${this.accessory.displayName}'] is offline,` +
-                'skipping device status refresh');
-        return;
-      }
-
-      this.platform.log.debug(`Refreshing device ['${this.accessory.displayName}'] details`);
-
-      // Active
       const active = deviceState.power
         ? this.platform.Characteristic.Active.ACTIVE
         : this.platform.Characteristic.Active.INACTIVE;
       this.fanService.updateCharacteristic(this.platform.Characteristic.Active, active);
 
-      // Rotation Speed
-      let fanSpeed = deviceState.last_recorded_speed;
-      if (fanSpeed > 5) {
-        fanSpeed = 5;
+      const speedPct = deviceState.power ? speedToPercentage(deviceState.last_recorded_speed) : 0;
+      this.fanService.updateCharacteristic(this.platform.Characteristic.RotationSpeed, speedPct);
+
+      this.lightbulbService.updateCharacteristic(this.platform.Characteristic.On, !!deviceState.led);
+
+      if (this.supportsBrightness && typeof deviceState.last_recorded_brightness === 'number') {
+        const b = clamp(deviceState.last_recorded_brightness, 0, BRIGHTNESS_MAX);
+        this.lightbulbService.updateCharacteristic(this.platform.Characteristic.Brightness, b);
       }
-      this.fanService.getCharacteristic(this.platform.Characteristic.RotationSpeed)
-        .updateValue(fanSpeed*20);
 
+      if (this.supportsColor && deviceState.last_recorded_color) {
+        this.lightbulbService.updateCharacteristic(
+          this.platform.Characteristic.ColorTemperature,
+          lightModeToMired(deviceState.last_recorded_color),
+        );
+      }
     } catch (error) {
-      this.platform.log.error('An error occurred while refreshing the device status. ' +
-            'Turn on debug mode for more information.');
-
-      // Only log if a Promise rejection reason was provided.
-      // Some errors are already logged at source.
+      this.platform.log.error('Failed to refresh device status; enable debug for details');
       if (error) {
         this.platform.log.debug(JSON.stringify(error));
       }
     }
   }
 
+  /**
+   * Called when the broadcast listener sees a beacon for this device. Beacons
+   * don't carry state, but their presence is proof the fan is reachable on the
+   * LAN, so flip is_online to true. This avoids refusing HomeKit commands when
+   * the cloud-side `is_online: false` at startup is stale.
+   */
+  public markOnline(): void {
+    this.fanState.is_online = true;
+  }
+
+  private assertOnline(): void {
+    if (!this.fanState.is_online) {
+      this.platform.log.info(`Device ['${this.accessory.displayName}'] is offline`);
+      throw new this.platform.api.hap.HapStatusError(HAPStatus.SERVICE_COMMUNICATION_FAILURE);
+    }
+  }
+
+  /**
+   * Dispatch a command, preferring the LAN UDP path when the device's IP is
+   * known. Falls back to the cloud API on UDP failure or when LAN control is
+   * disabled by the user (`useCloudOnly`).
+   */
+  private async sendDeviceUpdate(command: AtombergFanCommand): Promise<void> {
+    const deviceId = this.accessory.context.device.device_id;
+    const cloudPayload: AtombergFanCommandData = { device_id: deviceId, command };
+
+    if (!this.platform.platformConfig.useCloudOnly) {
+      const sentLocally = await this.platform.broadcastListener.sendLocalCommand(deviceId, command);
+      if (sentLocally) {
+        return;
+      }
+    }
+
+    try {
+      await this.atombergApi.sendCommand(cloudPayload);
+    } catch (error) {
+      this.platform.log.error('Failed to send device update; enable debug for details');
+      if (error) {
+        this.platform.log.debug(JSON.stringify(error));
+      }
+    }
+  }
+}
+
+function clamp(n: number, lo: number, hi: number): number {
+  return Math.max(lo, Math.min(hi, n));
+}
+
+/**
+ * Map a HomeKit 0..100 percentage to an Atomberg fan speed in 1..6.
+ * Mirrors the ordered-list mapping used in the Home Assistant integration so
+ * the same physical "speed N" lines up across both ecosystems.
+ */
+function percentageToSpeed(pct: number): number {
+  const clamped = clamp(pct, 1, 100);
+  // ceil ensures any positive percentage maps to at least speed 1.
+  return clamp(Math.ceil(clamped * FAN_SPEED_MAX / 100), FAN_SPEED_MIN, FAN_SPEED_MAX);
+}
+
+function speedToPercentage(speed: number): number {
+  if (speed <= 0) {
+    return 0;
+  }
+  return clamp(Math.round(speed * 100 / FAN_SPEED_MAX), 0, 100);
+}
+
+function miredToLightMode(mired: number): 'cool' | 'daylight' | 'warm' {
+  // Boundaries at the midpoints of the representative mireds: 154/200/370.
+  // 177 = (154+200)/2 (rounded), 285 = (200+370)/2 (rounded).
+  if (mired < 177) {
+    return LIGHT_MODE_COOL;
+  }
+  if (mired < 285) {
+    return LIGHT_MODE_DAYLIGHT;
+  }
+  return LIGHT_MODE_WARM;
+}
+
+function lightModeToMired(mode: string): number {
+  switch (mode.toLowerCase()) {
+    case LIGHT_MODE_COOL: return COLOR_TEMP_COOL_MIRED;
+    case LIGHT_MODE_DAYLIGHT: return COLOR_TEMP_DAYLIGHT_MIRED;
+    case LIGHT_MODE_WARM: return COLOR_TEMP_WARM_MIRED;
+    default: return COLOR_TEMP_DAYLIGHT_MIRED;
+  }
 }

@@ -1,61 +1,69 @@
-import axios, {AxiosError} from 'axios';
-import {LOGIN_RETRY_DELAY, LOGIN_TOKEN_REFRESH_INTERVAL, ATOMBERG_ERROR_CODES, ATOMBERG_API_HOST, ATOMBERG_API_ENDPOINTS} from './settings';
-import {AtombergFanPlatformConfig, AtombergFanDevice, AtombergFanDeviceState, AtombergFanCommandData} from './model';
+import axios, { AxiosError } from 'axios';
 import { Logger } from 'homebridge';
-
+import {
+  ATOMBERG_API_ENDPOINTS,
+  ATOMBERG_API_HOST,
+  ATOMBERG_ERROR_CODES,
+  LOGIN_RETRY_DELAY,
+  LOGIN_TOKEN_REFRESH_INTERVAL,
+} from './settings';
+import {
+  AtombergFanCommandData,
+  AtombergFanDevice,
+  AtombergFanDeviceState,
+  AtombergFanPlatformConfig,
+} from './model';
 
 /**
- * AtombergApi
- * This class is responsible for handling all API calls to the Atomberg platform.
+ * Atomberg cloud API client.
+ *
+ * Auth flow per Atomberg developer docs:
+ *   refresh_token  ── GET /v1/get_access_token ──▶ access_token (24h JWT)
+ *   access_token   ── all subsequent calls
+ *
+ * The plugin uses the cloud API only for: (1) initial device discovery,
+ * (2) initial state seeding, and (3) fallback when the LAN UDP path is
+ * unavailable. Routine state updates ride on UDP broadcasts to stay well
+ * below the 100 calls/day quota.
  */
 export default class AtombergApi {
-  private accessToken: string;
-  private _loginRefreshInterval: NodeJS.Timeout | undefined;
-  private _loginRetryTimeouts: NodeJS.Timeout[] = [];
+  private accessToken = '';
+  private accessTokenExpiresAt = 0;
+  private refreshTimer: NodeJS.Timeout | undefined;
+  private retryTimer: NodeJS.Timeout | undefined;
 
   constructor(
     private readonly logger: Logger,
     private readonly config: AtombergFanPlatformConfig,
-  ) {
-    this.accessToken = '';
-  }
+  ) {}
 
   public getAccessToken(): string {
     return this.accessToken;
   }
 
-
   public async login(): Promise<boolean> {
-    // Clear all previous login retry timeouts and intervals
-    for (const timeoutId of this._loginRetryTimeouts) {
-      clearTimeout(timeoutId);
-    }
-    clearInterval(<NodeJS.Timeout>this._loginRefreshInterval);
-
-    const headers = {
-      'accept': 'application/json',
-      'Content-Type': 'application/json',
-      'x-api-key': this.config.apiKey,
-      'Authorization': `Bearer ${this.config.refreshToken}`,
-    };
+    this.clearTimers();
 
     return axios.request({
       method: 'get',
       url: ATOMBERG_API_HOST + ATOMBERG_API_ENDPOINTS.GET_ACCESS_TOKEN,
-      headers: headers,
+      headers: {
+        'accept': 'application/json',
+        'Content-Type': 'application/json',
+        'x-api-key': this.config.apiKey,
+        'Authorization': `Bearer ${this.config.refreshToken}`,
+      },
     })
       .then((response) => {
         if (response.data.status !== 'Success') {
           this.accessToken = '';
-          this.retryLogin(JSON.stringify(response.data.message));
+          this.scheduleRetry(JSON.stringify(response.data.message));
           return false;
-        } else {
-          this.accessToken = response.data.message.access_token;
-          // Set an interval to refresh the login token periodically.
-          this._loginRefreshInterval = setInterval(this.login.bind(this),
-            LOGIN_TOKEN_REFRESH_INTERVAL);
-          return true;
         }
+        this.accessToken = response.data.message.access_token;
+        this.accessTokenExpiresAt = this.readJwtExpMs(this.accessToken);
+        this.scheduleProactiveRefresh();
+        return true;
       })
       .catch((error: AxiosError) => {
         this.handleNetworkRequestError(error);
@@ -63,154 +71,163 @@ export default class AtombergApi {
       });
   }
 
-  public async retryLogin(error: string) {
-    this.logger.debug('AtombergFanApi: AtombergFan platform login failed');
-    this.logger.debug(error);
-    this.logger.error(
-      `Login failed. Homebridge will try to log in again in ${LOGIN_RETRY_DELAY / 1000} seconds. ` +
-      'If the issue persists, make sure you configured the correct userId and password ' +
-      'and run the latest version of the plugin. ' +
-      'Restart Homebridge when you change your config, ' +
-      'as it will probably not have an effect on its own. ' +
-      'If the error still persists, please report to ' +
-      'https://github.com/Sangwan5688/homebridge-atomberg-fan/issues.',
-    );
-    // Try to login again after some time. Might just be a transient server issue.
-    this._loginRetryTimeouts.push(setTimeout(this.login.bind(this), LOGIN_RETRY_DELAY));
-  }
-
-
   public async getAllDevices(): Promise<AtombergFanDevice[]> {
-    this.logger.debug('AtombergFanApi: Fetching Device Details from AtombergFanApi platform');
-
+    this.logger.debug('AtombergFanApi: fetching device list');
     if (!this.accessToken) {
       return Promise.reject('No auth token available (login probably failed). ' +
-                'Check your credentials and restart HomeBridge.');
+        'Check your credentials and restart Homebridge.');
     }
 
     return axios.request({
       method: 'get',
       url: ATOMBERG_API_HOST + ATOMBERG_API_ENDPOINTS.GET_DEVICES,
-      headers: {
-        'accept': 'application/json',
-        'Content-Type': 'application/json',
-        'x-api-key': this.config.apiKey,
-        'Authorization': `Bearer ${this.accessToken}`,
-      },
+      headers: this.authHeaders(),
     })
       .then((response) => {
-        this.logger.debug(JSON.stringify(response.data));
         if (response.data.status !== 'Success') {
           return Promise.reject(response.data?.message ?? response.data);
         }
-        this.logger.debug('AtombergFanApi: AtombergFan platform getAllDevices success');
         return response.data.message.devices_list as AtombergFanDevice[];
       })
       .catch((error: AxiosError) => {
-        this.logger.debug('AtombergFanApi: AtombergFan platform getAllDevices failed');
-        this.handleNetworkRequestError(error);
-        return Promise.reject();
-      });
-  }
-
-  // NOT RECOMMENDED TO USE, WE WILL USE UDP INSTEAD
-  public async getDeviceState(): Promise<AtombergFanDeviceState[]> {
-    this.logger.debug('AtombergFanApi: Fetching Device State from AtombergFanApi platform');
-
-    if (!this.accessToken) {
-      return Promise.reject('No auth token available (login probably failed). ' +
-                'Check your credentials and restart HomeBridge.');
-    }
-
-    return axios.request({
-      method: 'get',
-      url: ATOMBERG_API_HOST + ATOMBERG_API_ENDPOINTS.GET_DEVICE_STATE,
-      headers: {
-        'accept': 'application/json',
-        'Content-Type': 'application/json',
-        'x-api-key': this.config.apiKey,
-        'Authorization': `Bearer ${this.accessToken}`,
-      },
-      params: {
-        'device_id': 'all',
-      },
-    })
-      .then((response) => {
-        this.logger.debug(JSON.stringify(response.data));
-        if (response.data.status !== 'Success') {
-          return Promise.reject(response.data?.message ?? response.data);
-        }
-        this.logger.debug('AtombergFanApi: AtombergFan platform getDeviceState successful');
-        return response.data.message.device_state as AtombergFanDeviceState[];
-      })
-      .catch((error: AxiosError) => {
-        this.logger.debug('AtombergFanApi: AtombergFan platform getDeviceState failed');
-        this.handleNetworkRequestError(error);
-        return Promise.reject();
-      });
-  }
-
-  public async sendCommand(data: AtombergFanCommandData): Promise<boolean> {
-    this.logger.debug('AtombergFanApi: Sending command to AtombergFanApi platform');
-
-    if (!this.accessToken) {
-      return Promise.reject('No auth token available (login probably failed). ' +
-                'Check your credentials and restart HomeBridge.');
-    }
-
-    return axios.request({
-      method: 'post',
-      url: ATOMBERG_API_HOST + ATOMBERG_API_ENDPOINTS.SEND_COMMAND,
-      headers: {
-        'accept': 'application/json',
-        'Content-Type': 'application/json',
-        'x-api-key': this.config.apiKey,
-        'Authorization': `Bearer ${this.accessToken}`,
-      },
-      data: data,
-    })
-      .then((response) => {
-        this.logger.debug(JSON.stringify(response.data));
-        if (response.data.status !== 'Success') {
-          return Promise.reject(response.data?.message ?? response.data);
-        }
-        return true;
-      })
-      .catch((error: AxiosError) => {
-        this.logger.error('AtombergFanApi: AtombergFan platform sendCommand failed');
         this.handleNetworkRequestError(error);
         return Promise.reject();
       });
   }
 
   /**
-     * Generic Axios error handler that checks which type of
-     * error occurred and prints the respective information.
-     *
-     * @see https://axios-http.com/docs/handling_errors
-     * @param error The error that is passes into the Axios error handler
-     */
+   * Cloud state lookup. Used once on startup; routine updates flow over UDP.
+   */
+  public async getDeviceState(): Promise<AtombergFanDeviceState[]> {
+    this.logger.debug('AtombergFanApi: fetching device state');
+    if (!this.accessToken) {
+      return Promise.reject('No auth token available (login probably failed). ' +
+        'Check your credentials and restart Homebridge.');
+    }
+
+    return axios.request({
+      method: 'get',
+      url: ATOMBERG_API_HOST + ATOMBERG_API_ENDPOINTS.GET_DEVICE_STATE,
+      headers: this.authHeaders(),
+      params: { device_id: 'all' },
+    })
+      .then((response) => {
+        if (response.data.status !== 'Success') {
+          return Promise.reject(response.data?.message ?? response.data);
+        }
+        return response.data.message.device_state as AtombergFanDeviceState[];
+      })
+      .catch((error: AxiosError) => {
+        this.handleNetworkRequestError(error);
+        return Promise.reject();
+      });
+  }
+
+  public async sendCommand(data: AtombergFanCommandData): Promise<boolean> {
+    if (!this.accessToken) {
+      return Promise.reject('No auth token available (login probably failed). ' +
+        'Check your credentials and restart Homebridge.');
+    }
+
+    return axios.request({
+      method: 'post',
+      url: ATOMBERG_API_HOST + ATOMBERG_API_ENDPOINTS.SEND_COMMAND,
+      headers: this.authHeaders(),
+      data,
+    })
+      .then((response) => {
+        if (response.data.status !== 'Success') {
+          return Promise.reject(response.data?.message ?? response.data);
+        }
+        return true;
+      })
+      .catch((error: AxiosError) => {
+        this.logger.error('AtombergFanApi: sendCommand failed');
+        this.handleNetworkRequestError(error);
+        return Promise.reject();
+      });
+  }
+
+  public shutdown(): void {
+    this.clearTimers();
+  }
+
+  private authHeaders() {
+    return {
+      'accept': 'application/json',
+      'Content-Type': 'application/json',
+      'x-api-key': this.config.apiKey,
+      'Authorization': `Bearer ${this.accessToken}`,
+    };
+  }
+
+  private clearTimers() {
+    if (this.refreshTimer) {
+      clearTimeout(this.refreshTimer);
+      this.refreshTimer = undefined;
+    }
+    if (this.retryTimer) {
+      clearTimeout(this.retryTimer);
+      this.retryTimer = undefined;
+    }
+  }
+
+  private scheduleProactiveRefresh() {
+    // Refresh 5 minutes before the JWT actually expires; fall back to the
+    // documented 23h cadence if we can't read the exp claim.
+    let delay = LOGIN_TOKEN_REFRESH_INTERVAL;
+    if (this.accessTokenExpiresAt > 0) {
+      delay = Math.max(60_000, this.accessTokenExpiresAt - Date.now() - 5 * 60_000);
+    }
+    this.refreshTimer = setTimeout(() => {
+      this.login().catch(() => undefined);
+    }, delay);
+  }
+
+  private scheduleRetry(error: string) {
+    this.logger.debug('AtombergFanApi: login failed: ' + error);
+    this.logger.error(
+      `Login failed. Homebridge will retry in ${LOGIN_RETRY_DELAY / 1000}s. ` +
+      'If the issue persists, verify the API key and refresh token in your config.',
+    );
+    this.retryTimer = setTimeout(() => {
+      this.login().catch(() => undefined);
+    }, LOGIN_RETRY_DELAY);
+  }
+
+  /**
+   * Read JWT `exp` (seconds since epoch) without verifying the signature.
+   * Returns 0 if the token is malformed — callers fall back to a fixed cadence.
+   */
+  private readJwtExpMs(token: string): number {
+    const parts = token.split('.');
+    if (parts.length < 2) {
+      return 0;
+    }
+    try {
+      const payloadB64 = parts[1].replace(/-/g, '+').replace(/_/g, '/');
+      const padded = payloadB64 + '='.repeat((4 - (payloadB64.length % 4)) % 4);
+      const payload = JSON.parse(Buffer.from(padded, 'base64').toString('utf8'));
+      return typeof payload.exp === 'number' ? payload.exp * 1000 : 0;
+    } catch {
+      return 0;
+    }
+  }
+
   private handleNetworkRequestError(error: AxiosError) {
     if (error.response) {
-      // The request was made and the server responded with a status code
-      // that falls out of the range of 2xx.
-      this.logger.debug(error?.response?.data ?? 'Some error occurred');
+      this.logger.debug(JSON.stringify(error.response.data ?? 'Some error occurred'));
       if (error.response.status === 401) {
-        // Unauthorised, try to log in again
-        this._loginRetryTimeouts.push(setTimeout(this.login.bind(this), LOGIN_RETRY_DELAY));
+        // Access token rejected — re-authenticate.
+        this.retryTimer = setTimeout(() => {
+          this.login().catch(() => undefined);
+        }, LOGIN_RETRY_DELAY);
       } else if (ATOMBERG_ERROR_CODES[error.response.status]) {
-        // Developer mode is disabled
         this.logger.error(ATOMBERG_ERROR_CODES[error.response.status]);
-      } else {
-        this.logger.debug(error?.response?.data ?? 'Some error occurred');
       }
     } else if (error.request) {
-      // The request was made but no response was received.
-      // `error.request` is an instance of XMLHttpRequest in the browser and an instance of
-      // http.ClientRequest in node.js
-      this.logger.debug(error.request);
+      this.logger.debug('No response from Atomberg API');
     } else {
-      // Something happened in setting up the request that triggered an error.
       this.logger.debug(error.message);
     }
   }
